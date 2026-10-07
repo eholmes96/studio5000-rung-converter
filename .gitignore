@@ -1,0 +1,13 @@
+# PyInstaller output: the exe ships as a GitHub Release asset, never in the repo
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Windows shortcuts hold absolute local paths
+*.lnk
+desktop.ini
+Thumbs.db
