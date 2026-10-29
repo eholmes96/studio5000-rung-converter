@@ -62,16 +62,21 @@ Everything is in `converter.py`, layered top to bottom:
 3. **Parsers**: `_parse_neutral` is a character scanner tracking paren depth, bracket depth and
    `$`-escaped `'string'` literals, so `Tag[1,2]` and `CPT(d,(a+b)*c)` survive. `_parse_ascii`
    tokenizes (a `"quoted run"` is one operand), then each mnemonic greedily consumes operand
-   tokens until the next mnemonic or keyword. Both return `(rungs, warnings, spans)`; the public
-   `parse_neutral`/`parse_ascii` drop the spans.
+   tokens until the next mnemonic or keyword. Both return `(rungs, warnings, spans, comments)`;
+   the public `parse_neutral`/`parse_ascii` return only `(rungs, warnings)`.
 4. **Emitters**: `emit_neutral_lines` / `emit_ascii_lines` return one string per rung. The panes
    show them one per line; the clipboard gets them joined into one line.
-5. **Pipeline**: `detect()` → `convert()` → a `Conversion` holding the output, per-rung display
-   lines for both panes, and warnings.
-6. **Syntax highlighting reuses the parsers**: `highlight_spans()` calls the same `_parse_*`
+5. **Pipeline**: `detect()` → `convert()` → a `Conversion` holding the single-line output, the
+   display lines for both panes (comment lines included), `input_single`, `neutral_lines` and
+   `comments` (one per rung, `None` when absent), and warnings.
+6. **Rung comments**: in the panes a comment is whole lines starting with `//`, above its rung.
+   Both parsers recognise them (`_comment_starts_here`) and give each to the rung that the next
+   logic after it belongs to (`attach_comment`). `detect()` strips them first. `read_shs`,
+   `build_shs` and `shs_pane_text` handle Studio's rung scrap files; see the Studio facts below.
+7. **Syntax highlighting reuses the parsers**: `highlight_spans()` calls the same `_parse_*`
    functions and maps their spans to Tk line/column positions. Colouring always matches how the
    text will actually be converted — that is how an unregistered AOI can be shown in red.
-7. **GUI**: `launch_gui()` defines `ProxyText`, `RungPane` and `App` *inside* the function.
+8. **GUI**: `launch_gui()` defines `ProxyText`, `RungPane` and `App` *inside* the function.
    `test_gui.py` depends on that: it patches `tk.Tk.mainloop`, finds the `App` among the root
    window's children, and calls its methods directly.
 
@@ -84,15 +89,22 @@ Flows in `App` that are easy to break:
 - `reformat=True` rewrites the input pane as one rung per line. It runs only on paste, load, Swap
   and Format rungs — never while typing, because the caret would jump. The user approved this.
 - The rung gutter is a Canvas numbered from 0 using `dlineinfo` per logical line, so it stays
-  aligned with word wrap on. `ProxyText` renames the Tk widget command to raise `<<Changed>>` on
-  every insert, delete and scroll.
+  aligned with word wrap on. It skips comment lines (`RungPane.rung_numbers`, cached on
+  `ProxyText.edit_serial`) and steps to each line's start, never `+1line`, which keeps the column
+  and lands on a wrapped continuation row. `ProxyText` renames the Tk widget command to raise
+  `<<Changed>>` on every insert, delete and scroll.
 - Find & Replace edits the input pane only. Highlight all greys every match in *both* panes; the
-  blue `sel` marks the active match in the input pane, and Replace acts only on that one.
+  blue `sel` marks the active match in the input pane, and Replace acts only on that one. With
+  Include comments off, `_matches` and `_skip_ranges` keep counting, highlighting, Find next,
+  Replace and Replace all out of comment lines.
+- Swap moves the output's *display* lines, not `current_output`, so the comments come along.
+- `load_path` and `save_shs_to` are the dialog-free halves of Load and Save .shs; the GUI tests
+  call them directly.
 
 ## Rules the output must follow
 
 - **Copy and Save always produce one line with no newline characters**, and saved files have no
-  trailing newline. Studio treats every newline in pasted ASCII as a rung break and inserts empty
+  trailing newline. They never carry comments; only Save .shs does. Studio treats every newline in pasted ASCII as a rung break and inserts empty
   rungs. This is the reason the tool exists.
 - ASCII: rung 0 has no leading `SOR`; every later rung starts with `SOR`; every rung ends with
   `EOR`. When reading, a rung ends at `EOR` *or* at the next `SOR`, so a missing `EOR` is tolerated.
@@ -106,6 +118,8 @@ Flows in `App` that are easy to break:
 - Never convert between v35 and v36 mnemonic spellings; reproduce whatever spelling came in.
 - Nesting deeper than `MAX_BRANCH_DEPTH` (100) raises `ConversionError`; the emitters are
   recursive and would otherwise exhaust the stack around 994 levels.
+- A `.shs` that comes in unchanged must go out byte for byte. Keep Studio's quirks, such as a
+  comment's trailing line break (shown as an empty `//` line).
 
 ## Facts about Studio that aren't in Rockwell's manuals, or where they conflict
 
@@ -116,6 +130,18 @@ Flows in `App` that are easy to break:
   (Sept 2025) still lists only the legacy names. Greater-than is `GT`, not `GR`.
 - RM014's branch examples use `[,A B]` — that leading comma is an empty first leg, not required
   syntax. Real Studio output writes `[leg,leg]`. Both parse.
+- **Studio's Ctrl+C carries no rung comments.** Checked 2026-10-29: the clipboard held only
+  plain text and a bitmap. Dragging rungs out of a routine makes a rung scrap file
+  (`RSLogix 5000 RLL Scrap '...'.shs`) that does carry them, and dragging a `.shs` into a
+  routine inserts its rungs and comments.
+- **Rung scrap layout**: a fixed 40-byte header (`CScrapFileHeader` class record plus the
+  UTF-16 CString `rungs`), then UTF-16LE text. Entries end in LF: `RG: <neutral>;`, then
+  `RC: <comment>` for the rung *before* it, with CR LF inside comments. There are no counts or
+  checksums. The whole file is written in C text mode, so every `0x0A` byte is stored as
+  `0x0D 0x0A`. The tool undoes and redoes that at byte level.
+- Verified in Studio 2026-10-29: script-built files (unchanged, one comment edited, one tag
+  renamed) dragged back in correctly. So did two files written by the app's own Save .shs
+  button: one saved unchanged, one after Replace all renamed a tag in one rung.
 
 ## Working with this user
 
@@ -132,7 +158,8 @@ Flows in `App` that are easy to break:
   them before they go into a fixture, the README, a commit message or an issue.
 - Prefers answers researched from Rockwell's own documentation. When a source and real behaviour
   disagree, document it in README's Sources section.
-- UI defaults they chose: Find & Replace open; Highlight all, Word wrap and Sync scroll on. Alt
+- UI defaults they chose: Find & Replace open; Highlight all, Word wrap and Sync scroll on;
+  Include comments off (to the right of Whole word); comments dark green above their rung. Alt
   shortcuts have an underlined letter: **C**opy output, Copy inpu**t**, **S**wap, **F**ormat
   rungs, **W**ord wrap, Fin**d** next, **R**eplace, Replace **a**ll. The menu bar deliberately has
   no Alt mnemonics so Alt+F reaches Format rungs. Double-click selects up to
@@ -187,7 +214,12 @@ Minor:
 - An unterminated `'string` literal swallows the rung's terminating `;`.
 - The exe is unsigned, so other machines show a SmartScreen warning on first run.
 
+Ideas, not started:
+- Accept a `.shs` dropped on the window, or pasted after Ctrl+C on the file in Explorer, so
+  Load file isn't needed.
+
 Not yet checked against a live Studio session:
+- Comments with non-ASCII characters, whose bytes can contain `0x0A`, through a `.shs`.
 - Omitting `SOR` on rung 0.
 - Leaving space-free expressions unquoted.
 - `LIMIT`, `TRUNC`, `TO_BCD` and `BCD_TO` on real v36 routines (the test fixtures are synthetic).

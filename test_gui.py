@@ -18,7 +18,9 @@ Requires no test framework and no network access.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 import traceback
 import tkinter as tk
 
@@ -536,6 +538,129 @@ def run_tests(root):
     check("empty input shows em dash", app.detect_label.cget("text") == "—")
     check("clear empties both panes",
           app.input_pane.get() == "" and app.current_output == "")
+
+    # ---------------------------------------------------------- rung comments
+    section("Rung comments from a Studio scrap file (.shs)")
+    tmp = tempfile.mkdtemp(prefix="rungconv-test-")
+    try:
+        src = os.path.join(tmp, "three rungs.shs")
+        with open(src, "wb") as fh:
+            fh.write(converter.SHS_FIXTURE)
+        check("loads a .shs", app.load_path(src) is True)
+        root.update()
+        lines = app.input_pane.get().split("\n")
+        check("comment lines sit above their rung",
+              lines[1] == "// ********" and lines[5] == "NOP();"
+              and lines[6] == "// RESET ON THE FALLING EDGE.", lines[:8])
+        check("status counts rungs and comments",
+              "3 rung(s) and 2 comment(s)" in app.status.cget("text"),
+              app.status.cget("text")[:60])
+        for pane, name in ((app.input_pane, "input"), (app.output_pane, "output")):
+            check(f"{name}: comment coloured", tags_at(pane, "AREA 1") == ["comment"],
+                  tags_at(pane, "AREA 1"))
+        check("comments are dark green by default",
+              str(app.input_pane.text.tag_cget("comment", "foreground")).lower()
+              == converter.DEFAULT_SYNTAX_COLORS["comment"].lower() == "#1b5e20")
+        check("output pane shows the comments too",
+              "// AREA 1 SAFETY GATE" in app.output_pane.get())
+
+        app.input_pane._redraw_gutter()
+        root.update()
+        gutter = app.input_pane.gutter
+        nums = [gutter.itemcget(i, "text") for i in gutter.find_all()]
+        check("gutter numbers rungs only, skipping comment lines",
+              nums == ["0", "1", "2"], nums)
+        nop_y = app.input_pane.text.dlineinfo("6.0")[1]
+        one = [i for i in gutter.find_all() if gutter.itemcget(i, "text") == "1"]
+        check("rung 1's number is beside NOP(), not its comment",
+              one and abs(gutter.coords(one[0])[1] - nop_y) < 2)
+
+        check("copied output carries no comments",
+              "//" not in app.current_output and "AREA" not in app.current_output)
+        check("copied input carries no comments",
+              "//" not in app.current_input_single and "\n" not in app.current_input_single)
+
+        out = os.path.join(tmp, "saved.shs")
+        check("saves a .shs", app.save_shs_to(out) is True)
+        check("unchanged rungs save byte for byte",
+              open(out, "rb").read() == converter.SHS_FIXTURE)
+
+        section("Find & Replace and comments")
+        boxes = [w.cget("text") for w in app.findbar.pack_slaves()
+                 if w.winfo_class() == "TCheckbutton"]
+        check("Include comments sits right of Whole word",
+              "Include comments" in boxes
+              and boxes.index("Include comments") == boxes.index("Whole word") + 1, boxes)
+        check("Include comments off by default", app.comments_var.get() is False)
+
+        app.toggle_find(True)
+        app.case_var.set(False); app.word_var.set(False)
+        app.find_var.set("gate")
+        app.update_match_count()
+        check("comment lines not counted when off",
+              app.match_label.cget("text") == "6 matches", app.match_label.cget("text"))
+        app.comments_var.set(True); app.update_match_count()
+        check("comment lines counted when on",
+              app.match_label.cget("text") == "8 matches", app.match_label.cget("text"))
+        app.comments_var.set(False); app.update_match_count()
+        in_ranges = app.input_pane.text.tag_ranges(converter.TAG_FIND_ALL)
+        check("highlight all skips comments when off", len(in_ranges) // 2 == 6,
+              len(in_ranges) // 2)
+
+        app.input_pane.text.mark_set("insert", "1.0")
+        for _ in range(7):
+            app.find_next()
+        sel_line = app.input_pane.text.get("sel.first linestart", "sel.first lineend")
+        check("find next never lands in a comment when off",
+              not sel_line.lstrip().startswith("//"), sel_line[:30])
+
+        app.input_pane.text.tag_remove("sel", "1.0", "end")
+        app.input_pane.text.tag_add("sel", "3.17", "3.21")     # GATE in a comment
+        check("test selects a real match inside a comment",
+              app.input_pane.text.get("sel.first", "sel.last") == "GATE",
+              app.input_pane.text.get("sel.first", "sel.last"))
+        app.repl_var.set("Door")
+        before = app.input_pane.get()
+        app.replace_one()
+        check("replace never touches a selected comment when off",
+              "AREA 1 SAFETY GATE" in app.input_pane.get()
+              and app.input_pane.get().count("Gate[1]") == before.count("Gate[1]"))
+
+        app.replace_all()
+        root.update()
+        text_now = app.input_pane.get()
+        check("replace all renames the logic",
+              text_now.count("Door[1]") == 6 and "Gate[1]" not in text_now,
+              text_now.count("Door[1]"))
+        check("replace all leaves comments alone when off",
+              "// AREA 1 SAFETY GATE" in text_now and "// GATE 1" in text_now)
+        app.save_shs_to(out)
+        renamed_rungs, renamed_comments, _ = converter.read_shs(open(out, "rb").read())
+        check("saved .shs has renamed rungs and the original comments",
+              all("Door[1]" in r for r in renamed_rungs if r != "NOP();")
+              and renamed_comments == converter.SHS_FIXTURE_COMMENTS)
+
+        app.comments_var.set(True)
+        app.find_var.set("GATE 1"); app.repl_var.set("GATE 2")
+        app.replace_all()
+        root.update()
+        check("replace all edits comments when on", "// GATE 2" in app.input_pane.get())
+        app.comments_var.set(False)
+
+        section("Swap keeps comments")
+        app.load_path(src)
+        app.swap()
+        root.update()
+        check("swap to ASCII keeps the comment lines",
+              app.detect_label.cget("text") == "ASCII detected"
+              and "// AREA 1 SAFETY GATE" in app.input_pane.get())
+        app.save_shs_to(out)
+        check("a .shs saved from the ASCII side is byte for byte",
+              open(out, "rb").read() == converter.SHS_FIXTURE)
+        app.toggle_find(True)
+        app.find_var.set("")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     section("Large routine and scroll sync")
     app.set_input_text(converter.CANON_NEUTRAL * 12)

@@ -138,6 +138,8 @@ the clean fix if you plan to hand it around widely.
 | **Word wrap** | **On by default.** Toggles wrapping in both panes; the gutter still numbers one entry per rung. |
 | **Sync scroll** | Locks the two panes' vertical scrolling together. |
 | **Find & Replace** | Open by default. Ctrl+F / Ctrl+H focuses the Find field; Esc hides the bar. |
+| **Load file…** | Opens a text file, or a Studio rung scrap (`.shs`) with its rung comments. |
+| **Save .shs for Studio…** | Saves the rungs *and their comments* as a `.shs` file to drag into a Studio routine. See [Keeping rung comments](#keeping-rung-comments). |
 
 The gutter numbers **rungs starting at 0**, matching Studio's own rung numbering.
 
@@ -184,6 +186,7 @@ the AOI category possible.
 | AOI / unknown | mnemonic not in the known set | red `#A32D2D` |
 | Raw value | `5000`, `16#000F`, `'text'` | green `#3B6D11` |
 | Quoted expression | the `CPT`/`CMP`/`FAL`/`FSC` expression | amber `#854F0B` |
+| Rung comment | a `//` comment line above its rung | dark green `#1B5E20` |
 
 Tags and ordinary operands are deliberately **not** coloured — they use the pane's normal
 text colour. On a 200-rung routine that restraint is what keeps the highlighting readable.
@@ -237,14 +240,19 @@ typing freely, the gutter is showing plain 0-based line numbers.
 Operates on the **input pane only**; the output updates indirectly through the normal
 conversion path. Fields: Find, Replace. Buttons: Find next, Replace, Replace all, with a
 live match counter. Checkboxes: **Case-sensitive**, **Whole word** (match bounded by
-non-word characters; plain substring otherwise).
+non-word characters; plain substring otherwise), and **Include comments**.
+
+**Include comments** (off by default). Off, Find & Replace skips the `//` comment lines
+entirely: they are not counted, highlighted, found or replaced, so renaming a tag changes
+only the logic. Tick it to search and replace inside comments as well.
 
 **Highlight all** (on by default, leftmost checkbox). Every occurrence of the find term gets
 a grey background; the **active** match keeps the normal blue selection. So you can see at a
 glance that a tag appears five times, while still knowing which one **Replace** will act on
 — Replace only ever touches the blue one.
 
-Highlighting applies to the input pane only, matching where Find & Replace operates.
+Highlighting greys the matches in both panes; the blue active match and every edit stay
+in the input pane.
 
 **History dropdowns.** Both fields remember what you've used, Excel-style:
 
@@ -255,6 +263,38 @@ Highlighting applies to the input pane only, matching where Find & Replace opera
   or Replace all — not on every keystroke.
 
 History lives for the session only; it is not written to disk.
+
+---
+
+## Keeping rung comments
+
+Studio's **Ctrl+C puts no rung comments on the clipboard**, only the logic as plain text,
+so pasting rungs in and out loses every comment. Studio's *rung scrap file* does carry
+them, and Studio makes one whenever you drag rungs out of a routine.
+
+1. In Studio, select the rungs and **drag them onto the desktop** (or into any folder).
+   Studio creates a file named like `RSLogix 5000 RLL Scrap 'XIC(...'.shs`.
+2. In the converter, **Load file…** and pick that `.shs`. Each rung appears on its own
+   line with its comment above it, in dark green, as lines starting with `//`.
+3. Edit as usual. Find & Replace leaves the comments alone unless you tick
+   **Include comments**.
+4. **Save .shs for Studio…**, then **drag the saved file into the routine** in Studio.
+   The rungs are inserted with their comments.
+
+How comment lines work in the panes:
+
+- A comment line is a whole line starting with `//` (spaces before it are fine). `//`
+  after logic on the same line is not a comment.
+- A comment belongs to the rung directly **below** it, the next logic after it. Lines you
+  type yourself follow the same rule, so you can add, edit or delete comments in the pane.
+- A comment after the last rung belongs to no rung. It raises a warning and is left out of
+  the saved file.
+- A Studio comment that ends in a line break shows as a final empty `//` line. It is kept
+  so the comment goes back exactly as it came.
+- **Copy output**, **Copy input** and **Save output…** never include comments; plain text
+  has nowhere to put them. Only **Save .shs** carries them, always as Neutral text, even if
+  the input pane holds ASCII. **⇄ Swap** keeps the comments.
+- The gutter numbers rungs only, so the numbers still match Studio's.
 
 ---
 
@@ -428,6 +468,24 @@ rename landed two releases earlier in v36. The online help is correct and the ma
 stale, so the v36 names are carried in a separate `V36_MNEMONIC_UPDATES` map rather than
 being merged into the RM014-derived list. That keeps each list traceable to its own source.
 
+### Studio rung scrap files (`.shs`)
+
+Not documented by Rockwell. The layout was worked out from files Studio itself made:
+
+- A fixed 40-byte header: an MFC class record for `CScrapFileHeader`, then the
+  length-prefixed UTF-16 string `rungs`.
+- UTF-16LE text with one entry per LF: `RG: <neutral text>;` is a rung, and `RC: <comment>`
+  is the comment of the rung *before* it. Line breaks inside a comment are CR LF. There are
+  no counts, lengths or checksums.
+- Studio writes the whole file in C text mode, so every `0x0A` byte is stored as
+  `0x0D 0x0A`. The tool undoes that when reading and repeats it when writing.
+
+Checked in Studio on 2026-10-29: a real file rebuilt byte for byte by the same code, then a
+copy with one comment edited, then a copy with a tag renamed, were each dragged back into a
+routine and inserted correctly. Those files were made by a script using the format code;
+a file written by the app's own **Save .shs** button has not yet been dragged into Studio.
+Studio's Ctrl+C was checked the same day: the clipboard held only plain text and a picture.
+
 ### Spec vs. sample: the branch discrepancy
 
 **The manual and the working sample encode branches differently, and the tool accepts
@@ -498,9 +556,11 @@ message. The realistic trigger is picking the wrong file, not real logic.
   rung rather than failing silently. Logix string literals use single quotes, so this
   should not arise in practice.
 
-- **Rung comments are out of scope for v1.** They don't appear in the plain-text copy that
-  Studio produces. Stray non-logic text is passed through untouched and raises a soft
-  warning rather than crashing, but it is not parsed or re-associated with a rung.
+- **Rung comments need a `.shs` file.** Studio's plain-text copy has none, so comments only
+  come through [Keeping rung comments](#keeping-rung-comments). Stray non-logic text is
+  passed through untouched and raises a soft warning rather than crashing.
+
+- **Only rung comments.** Instruction and operand descriptions are not carried.
 
 - **Ladder (RLL) only.** Structured Text, Function Block Diagram and SFC are not supported.
 
@@ -512,7 +572,7 @@ message. The realistic trigger is picking the wrong file, not real logic.
 
 ## What the self-test covers
 
-`python converter.py --selftest` runs 33 conversion checks plus format detection,
+`python converter.py --selftest` runs 42 conversion checks plus format detection,
 newline-free output, and AOI passthrough:
 
 - Both directions against the canonical paired fixture (a real safety routine, with the
@@ -544,5 +604,14 @@ newline-free output, and AOI passthrough:
 - RM014's leading-comma branch form.
 - Detection, including keyword-shaped tags inside operands (`XIC(SOR)OTE(BND);` is
   correctly read as Neutral, not ASCII).
+- **Rung comments and `.shs` files**: a scrap file laid out as Studio writes one (text-mode
+  `0x0D 0x0A` included) reads into the right rungs and comments, and rebuilds byte for byte,
+  directly, through the pane and through the ASCII side. Comments attach to the rung after
+  them, even after a missing `EOR`; never leak into the single-line output; never decide the
+  detected format; and a commented empty last rung is kept.
+
+`python test_gui.py` adds the GUI side: loading a `.shs`, dark-green comment lines in both
+panes, a gutter that skips them, Include comments on and off for counting, highlighting,
+Find next, Replace and Replace all, and saving back byte for byte from either format.
 
 Any round-trip mismatch is reported as a failure with a character-level diff.

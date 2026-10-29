@@ -163,9 +163,10 @@ TAG_INSTRUCTION = "instruction"
 TAG_AOI = "aoi"
 TAG_LITERAL = "literal"
 TAG_EXPRESSION = "expression"
+TAG_COMMENT = "comment"
 
 SYNTAX_CATEGORIES = (TAG_RUNG, TAG_BRANCH, TAG_INSTRUCTION, TAG_AOI,
-                     TAG_LITERAL, TAG_EXPRESSION)
+                     TAG_LITERAL, TAG_EXPRESSION, TAG_COMMENT)
 
 # Not a syntax category: a background tag marking the other occurrences of the
 # current find term, so the active (blue) match stays distinguishable from them.
@@ -178,6 +179,7 @@ DEFAULT_SYNTAX_COLORS = {
     TAG_AOI: "#A32D2D",          # mnemonic not in the known set
     TAG_LITERAL: "#3B6D11",      # 5000, 16#000F, 'text'
     TAG_EXPRESSION: "#854F0B",   # the CPT/CMP/FAL/FSC expression operand
+    TAG_COMMENT: "#1B5E20",      # // rung comment lines (dark green)
 }
 
 SYNTAX_LABELS = {
@@ -187,6 +189,7 @@ SYNTAX_LABELS = {
     TAG_AOI: "AOI / unknown",
     TAG_LITERAL: "Raw value",
     TAG_EXPRESSION: "Quoted expression",
+    TAG_COMMENT: "Rung comment",
 }
 
 SYNTAX_HINTS = {
@@ -196,7 +199,59 @@ SYNTAX_HINTS = {
     TAG_AOI: "mnemonic not in the known set",
     TAG_LITERAL: "5000   16#000F   'text'",
     TAG_EXPRESSION: "the CPT / CMP / FAL / FSC expression",
+    TAG_COMMENT: "// a line above its rung",
 }
+
+# ---------------------------------------------------------------------------
+# Rung comments
+# ---------------------------------------------------------------------------
+# Studio's plain-text copy carries no comments, but its rung scrap file (.shs,
+# see the "Studio rung scrap files" section below) does. In the panes a comment
+# is shown as lines starting with "//" directly ABOVE the rung it belongs to.
+# Only a whole line counts: "//" after logic on the same line is not a comment.
+# A comment belongs to the rung that the next piece of logic after it is part of.
+COMMENT_PREFIX = "//"
+COMMENT_LINE = re.compile(r"(?m)^[ \t]*//.*$")
+
+
+def _comment_starts_here(text: str, i: int) -> bool:
+    """True if text[i:] begins a comment line: '//' with only spaces/tabs before
+    it on its line."""
+    if not text.startswith(COMMENT_PREFIX, i):
+        return False
+    j = i - 1
+    while j >= 0 and text[j] in " \t":
+        j -= 1
+    return j < 0 or text[j] == "\n"
+
+
+def _scan_comment_line(text: str, i: int) -> tuple[str, int]:
+    """Read the comment line starting at text[i] == '/'. Returns the comment text
+    (prefix and one following space removed, trailing CR dropped) and the index
+    of the line's terminating newline (or len(text))."""
+    end = text.find("\n", i)
+    if end < 0:
+        end = len(text)
+    body = text[i + len(COMMENT_PREFIX):end].rstrip("\r")
+    if body.startswith(" "):
+        body = body[1:]
+    return body, end
+
+
+def comment_display_lines(comment: str) -> list[str]:
+    """Pane lines for one rung comment: '// ' before every line of it."""
+    return [(COMMENT_PREFIX + " " + line) if line else COMMENT_PREFIX
+            for line in comment.split("\n")]
+
+
+def _with_comments(lines: list[str], comments: list[str | None]) -> list[str]:
+    """Interleave each rung's comment lines above the rung's own line."""
+    out: list[str] = []
+    for line, comment in zip(lines, comments):
+        if comment is not None:
+            out.extend(comment_display_lines(comment))
+        out.append(line)
+    return out
 
 # A raw value: decimal, float, exponent, or a radix-prefixed Logix literal
 # (2#0000_1111, 8#017, 16#000F). Quoted strings are handled separately.
@@ -375,18 +430,28 @@ def _scan_operands(text: str, i: int) -> tuple[list[str], list[tuple[int, int]],
 
 
 def parse_neutral(text: str) -> tuple[list[list], list[str]]:
-    rungs, warnings, _ = _parse_neutral(text)
+    rungs, warnings, _, _ = _parse_neutral(text)
     return rungs, warnings
 
 
-def _parse_neutral(text: str) -> tuple[list[list], list[str], list[tuple[int, int, str]]]:
+def _parse_neutral(text: str) -> tuple[list[list], list[str], list[tuple[int, int, str]],
+                                       list[str | None]]:
     """Parse neutral text into a list of rungs. Stack-based; newlines are whitespace.
 
-    Also returns highlight spans as (start, end, category) offsets into `text`.
+    Also returns highlight spans as (start, end, category) offsets into `text`, and
+    one comment per rung (None where the rung has none) from '//' lines.
     """
     warnings: list[str] = []
     rungs: list[list] = []
     spans: list[tuple[int, int, str]] = []
+    pending: list[str] = []                  # comment lines not yet given a rung
+    comments: dict[int, list[str]] = {}
+
+    def attach_comment() -> None:
+        # Logic is about to land in rung number len(rungs): it owns the comment.
+        if pending:
+            comments.setdefault(len(rungs), []).extend(pending)
+            pending.clear()
 
     rung: list = []
     branch_stack: list[Branch] = []
@@ -418,6 +483,16 @@ def _parse_neutral(text: str) -> tuple[list[list], list[str], list[tuple[int, in
         if c.isspace():
             i += 1
             continue
+
+        if c == "/" and _comment_starts_here(text, i):
+            flush_stray()
+            body, end = _scan_comment_line(text, i)
+            spans.append((i, end, TAG_COMMENT))
+            pending.append(body)
+            i = end
+            continue
+
+        attach_comment()
 
         if c == "[":
             flush_stray()
@@ -506,9 +581,12 @@ def _parse_neutral(text: str) -> tuple[list[list], list[str], list[tuple[int, in
     if rung:
         warnings.append("Last rung had no terminating ';' - added.")
         end_rung()
+    if pending:
+        warnings.append(_ORPHAN_COMMENT_WARNING)
 
-    _strip_trailing_empty_rung(rungs)
-    return rungs, warnings, spans
+    rung_comments = _comment_list(comments, len(rungs))
+    _strip_trailing_empty_rung(rungs, rung_comments)
+    return rungs, warnings, spans, rung_comments
 
 
 # ---------------------------------------------------------------------------
@@ -525,21 +603,28 @@ def classify_token(tok: str) -> bool:
     return bool(MNEMONIC_SHAPE.match(tok))
 
 
-def _tokenize_ascii(text: str, warnings: list[str]) -> list[tuple[bool, str, int, int]]:
-    """Split ASCII text into (is_quoted, token, start, end) tuples.
+def _tokenize_ascii(text: str, warnings: list[str]) -> list[tuple[str, str, int, int]]:
+    """Split ASCII text into (kind, token, start, end) tuples, kind being "word",
+    "quoted" or "comment".
 
     A double-quoted run is one token no matter how much whitespace it contains,
     which is how an expression operand such as
     "_Drive1:I.OutputCurrent / (Drive1.Config.MotorFLA *100)" survives. A quoted token
     is always an operand and is never classified as a mnemonic. Offsets span the
-    quotes as well, so highlighting covers the whole literal.
+    quotes as well, so highlighting covers the whole literal. A "comment" token is
+    a whole '//' line; its text has the prefix removed.
     """
-    tokens: list[tuple[bool, str, int, int]] = []
+    tokens: list[tuple[str, str, int, int]] = []
     i, n = 0, len(text)
     while i < n:
         c = text[i]
         if c.isspace():
             i += 1
+            continue
+        if c == "/" and _comment_starts_here(text, i):
+            body, end = _scan_comment_line(text, i)
+            tokens.append(("comment", body, i, end))
+            i = end
             continue
         if c == '"':
             j = i + 1
@@ -548,15 +633,15 @@ def _tokenize_ascii(text: str, warnings: list[str]) -> list[tuple[bool, str, int
             if j >= n:
                 warnings.append("Unterminated double quote - text to end of input "
                                 "was read as one operand.")
-                tokens.append((True, text[i + 1:], i, n))
+                tokens.append(("quoted", text[i + 1:], i, n))
                 break
-            tokens.append((True, text[i + 1:j], i, j + 1))
+            tokens.append(("quoted", text[i + 1:j], i, j + 1))
             i = j + 1
             continue
         j = i
         while j < n and not text[j].isspace():
             j += 1
-        tokens.append((False, text[i:j], i, j))
+        tokens.append(("word", text[i:j], i, j))
         i = j
     return tokens
 
@@ -584,22 +669,32 @@ def _rejoin_expression_operands(elements: list, warnings: list[str]) -> None:
 
 
 def parse_ascii(text: str) -> tuple[list[list], list[str]]:
-    rungs, warnings, _ = _parse_ascii(text)
+    rungs, warnings, _, _ = _parse_ascii(text)
     return rungs, warnings
 
 
-def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int, str]]]:
+def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int, str]],
+                                     list[str | None]]:
     """Parse ASCII text into a list of rungs.
 
     Rung boundaries come only from tokens, never from newlines: a rung ends at
     EOR or at the next SOR, whichever comes first.
 
-    Also returns highlight spans as (start, end, category) offsets into `text`.
+    Also returns highlight spans as (start, end, category) offsets into `text`, and
+    one comment per rung (None where the rung has none) from '//' lines.
     """
     warnings: list[str] = []
     unknown: list[str] = []
     rungs: list[list] = []
     spans: list[tuple[int, int, str]] = []
+    pending: list[str] = []                  # comment lines not yet given a rung
+    comments: dict[int, list[str]] = {}
+
+    def attach_comment() -> None:
+        # The open rung is not in `rungs` yet, so its number is len(rungs).
+        if pending:
+            comments.setdefault(len(rungs), []).extend(pending)
+            pending.clear()
 
     rung: list | None = None
     branch_stack: list[Branch] = []
@@ -632,10 +727,16 @@ def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int,
             current = None
             forced_operands = 0
 
-    for quoted, tok, start, end in _tokenize_ascii(text, warnings):
-        if quoted:
+    for kind, tok, start, end in _tokenize_ascii(text, warnings):
+        if kind == "comment":
+            spans.append((start, end, TAG_COMMENT))
+            pending.append(tok)
+            continue
+
+        if kind == "quoted":
             # A quoted token is an operand by definition, never a mnemonic.
             open_rung()
+            attach_comment()
             spans.append((start, end, TAG_EXPRESSION))
             if current is None:
                 warnings.append(f"Quoted operand {tok!r} had no preceding instruction "
@@ -649,6 +750,7 @@ def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int,
         if tok == TOK_SOR:
             close_rung()
             open_rung()
+            attach_comment()
             current = None
             forced_operands = 0
             spans.append((start, end, TAG_RUNG))
@@ -656,11 +758,13 @@ def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int,
 
         if tok == TOK_EOR:
             open_rung()
+            attach_comment()
             close_rung()
             spans.append((start, end, TAG_RUNG))
             continue
 
         open_rung()
+        attach_comment()
 
         if tok == TOK_BST:
             current = None
@@ -732,7 +836,10 @@ def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int,
                     forced_operands -= 1
 
     close_rung()
-    _strip_trailing_empty_rung(rungs)
+    if pending:
+        warnings.append(_ORPHAN_COMMENT_WARNING)
+    rung_comments = _comment_list(comments, len(rungs))
+    _strip_trailing_empty_rung(rungs, rung_comments)
 
     for r in rungs:
         _rejoin_expression_operands(r, warnings)
@@ -743,7 +850,7 @@ def _parse_ascii(text: str) -> tuple[list[list], list[str], list[tuple[int, int,
         warnings.append(
             "Unrecognized instruction(s): " + ", ".join(seen) + " - verify output."
         )
-    return rungs, warnings, spans
+    return rungs, warnings, spans, rung_comments
 
 
 def highlight_spans(text: str, kind: str) -> list[tuple[int, int, int, int, str]]:
@@ -753,9 +860,9 @@ def highlight_spans(text: str, kind: str) -> list[tuple[int, int, int, int, str]
     input pane highlights correctly even when it has not been reformatted.
     """
     if kind == "Neutral":
-        _, _, spans = _parse_neutral(text)
+        _, _, spans, _ = _parse_neutral(text)
     elif kind == "ASCII":
-        _, _, spans = _parse_ascii(text)
+        _, _, spans, _ = _parse_ascii(text)
     else:
         return []
 
@@ -775,11 +882,22 @@ def highlight_spans(text: str, kind: str) -> list[tuple[int, int, int, int, str]
     return out
 
 
-def _strip_trailing_empty_rung(rungs: list[list]) -> None:
+def _strip_trailing_empty_rung(rungs: list[list], comments: list[str | None]) -> None:
     """Studio appends the routine's END rung on a whole-routine copy. Drop at most
-    one trailing empty rung; never touch a non-trailing empty rung."""
-    if rungs and not rungs[-1]:
+    one trailing empty rung; never touch a non-trailing empty rung, and never drop
+    an empty rung that carries a comment."""
+    if rungs and not rungs[-1] and comments[-1] is None:
         rungs.pop()
+        comments.pop()
+
+
+_ORPHAN_COMMENT_WARNING = ("A comment after the last rung belongs to no rung - it is "
+                           "shown but not carried into a saved .shs.")
+
+
+def _comment_list(comments: dict[int, list[str]], count: int) -> list[str | None]:
+    """One entry per rung: the rung's comment lines joined by newlines, or None."""
+    return ["\n".join(comments[k]) if k in comments else None for k in range(count)]
 
 
 # ---------------------------------------------------------------------------
@@ -864,7 +982,12 @@ def emit_ascii(rungs: list[list]) -> str:
 # Detection and the conversion pipeline
 # ---------------------------------------------------------------------------
 def detect(text: str) -> str | None:
-    """Return 'Neutral', 'ASCII', 'Unrecognized', or None when the input is empty."""
+    """Return 'Neutral', 'ASCII', 'Unrecognized', or None when the input is empty.
+
+    Comment lines are ignored, so a comment mentioning SOR or BND (or holding a
+    ';') never decides the format.
+    """
+    text = COMMENT_LINE.sub("", text)
     if not text.strip():
         return None
 
@@ -888,8 +1011,12 @@ def detect(text: str) -> str | None:
 class Conversion:
     kind: str | None                  # 'Neutral' | 'ASCII' | 'Unrecognized' | None
     output: str = ""                  # single-line, newline-free, Studio-safe
-    output_lines: list[str] = field(default_factory=list)   # display: one rung per line
+    # Display: one rung per line, each rung's '//' comment lines above it.
+    output_lines: list[str] = field(default_factory=list)
     input_lines: list[str] = field(default_factory=list)    # normalized input display
+    input_single: str = ""            # the input format, single line, no comments
+    neutral_lines: list[str] = field(default_factory=list)  # one per rung, no comments
+    comments: list[str | None] = field(default_factory=list)  # one per rung
     warnings: list[str] = field(default_factory=list)
     rung_count: int = 0
 
@@ -904,24 +1031,117 @@ def convert(text: str) -> Conversion:
         return Conversion(kind=kind)
 
     if kind == "Neutral":
-        rungs, warnings = parse_neutral(text)
+        rungs, warnings, _, comments = _parse_neutral(text)
         out_lines, w2 = emit_ascii_lines(rungs)
         output = " ".join(out_lines)
-        in_lines = emit_neutral_lines(rungs)
+        in_lines = neutral_lines = emit_neutral_lines(rungs)
+        input_single = "".join(in_lines)
     else:
-        rungs, warnings = parse_ascii(text)
-        out_lines = emit_neutral_lines(rungs)
+        rungs, warnings, _, comments = _parse_ascii(text)
+        out_lines = neutral_lines = emit_neutral_lines(rungs)
         output = "".join(out_lines)
         in_lines, w2 = emit_ascii_lines(rungs)
+        input_single = " ".join(in_lines)
 
     return Conversion(
         kind=kind,
         output=output,
-        output_lines=out_lines,
-        input_lines=in_lines,
+        output_lines=_with_comments(out_lines, comments),
+        input_lines=_with_comments(in_lines, comments),
+        input_single=input_single,
+        neutral_lines=neutral_lines,
+        comments=comments,
         warnings=warnings + w2,
         rung_count=len(rungs),
     )
+
+
+# ---------------------------------------------------------------------------
+# Studio rung scrap files (.shs)
+# ---------------------------------------------------------------------------
+# Dragging rungs out of a Studio routine onto the desktop or a folder makes a file
+# named "RSLogix 5000 RLL Scrap '...'.shs"; dragging such a file back into a
+# routine inserts its rungs, comments included. Studio's Ctrl+C puts only plain
+# text (no comments) on the clipboard, so this file is the only way comments
+# travel. Not documented by Rockwell; worked out from Studio's own files and
+# confirmed by dragging rebuilt files back into Studio (README, Sources).
+#
+# Layout:
+#   * A fixed 40-byte header: an MFC class tag for "CScrapFileHeader", then the
+#     length-prefixed UTF-16 string "rungs".
+#   * UTF-16LE text, one entry per LF: "RG: <neutral text>;" is a rung and
+#     "RC: <comment>" is the comment of the rung just before it. Line breaks
+#     inside a comment are CR LF. There are no counts, lengths or checksums.
+#   * Studio writes the whole file in C text mode, so every 0x0A *byte* is stored
+#     as 0x0D 0x0A. Reading undoes that and writing redoes it.
+SHS_CLASS = b"\xff\xff\x00\x00\x10\x00CScrapFileHeader"
+SHS_HEADER = SHS_CLASS + b"\x01\x00\x00\x00\xff\xfe\xff\x05" + "rungs".encode("utf-16-le")
+SHS_ENTRY_SPLIT = re.compile(r"(?<!\r)\n")     # an LF that is not part of a CR LF
+
+
+def is_shs(data: bytes) -> bool:
+    return data.startswith(SHS_CLASS)
+
+
+def read_shs(data: bytes) -> tuple[list[str], list[str | None], list[str]]:
+    """Read a Studio rung scrap file into (neutral rung lines, comments, warnings).
+
+    comments[k] is rung k's comment with '\\n' line breaks, or None.
+    """
+    raw = data.replace(b"\r\n", b"\n")
+    if not raw.startswith(SHS_CLASS):
+        raise ConversionError("This is not a Studio rung scrap (.shs) file.")
+    if not raw.startswith(SHS_HEADER):
+        raise ConversionError("This Studio scrap file does not hold ladder rungs, or "
+                              "uses a layout this tool has not seen before.")
+    try:
+        body = raw[len(SHS_HEADER):].decode("utf-16-le")
+    except UnicodeDecodeError as exc:
+        raise ConversionError(f"The scrap file's text could not be read: {exc}") from exc
+
+    rungs: list[str] = []
+    comments: list[str | None] = []
+    warnings: list[str] = []
+    for entry in SHS_ENTRY_SPLIT.split(body):
+        if not entry:
+            continue
+        tag, _, value = entry.partition(": ")
+        if tag == "RG":
+            rungs.append(value)
+            comments.append(None)
+        elif tag == "RC":
+            text = value.replace("\r\n", "\n")
+            if not rungs:
+                warnings.append("The scrap file has a comment before its first rung "
+                                "- ignored.")
+            elif comments[-1] is None:
+                comments[-1] = text
+            else:
+                comments[-1] += "\n" + text
+        else:
+            warnings.append(f"Unrecognized entry in the scrap file ignored: {entry[:40]!r}")
+    if not rungs:
+        raise ConversionError("The scrap file contains no rungs.")
+    return rungs, comments, warnings
+
+
+def shs_pane_text(data: bytes) -> tuple[str, list[str]]:
+    """A scrap file as pane text: each rung on its own line, its comment above it."""
+    rungs, comments, warnings = read_shs(data)
+    return "\n".join(_with_comments(rungs, comments)), warnings
+
+
+def build_shs(neutral_lines: list[str], comments: list[str | None]) -> bytes:
+    """Write rungs and their comments as a Studio rung scrap file."""
+    parts: list[str] = []
+    for number, (line, comment) in enumerate(zip(neutral_lines, comments)):
+        if "\n" in line or "\r" in line:
+            raise ConversionError(f"Rung {number} has a line break inside an operand, "
+                                  f"which a scrap file cannot hold. Remove it and retry.")
+        parts.append(f"RG: {line}\n")
+        if comment is not None:
+            parts.append("RC: " + comment.replace("\n", "\r\n") + "\n")
+    return (SHS_HEADER + "".join(parts).encode("utf-16-le")).replace(b"\n", b"\r\n")
 
 
 def neutral_to_ascii(text: str) -> str:
@@ -1029,6 +1249,24 @@ EXPR2_ASCII = (
     'SOR FAL Ctl 10 0 ALL Dst[0] "Src[0] + 5" EOR '
     'SOR FSC Ctl2 10 0 INC "Src[0] >= Limit" EOR'
 )
+
+# A rung scrap (.shs) laid out exactly as Studio writes one -- invented tags and
+# comments, but the structure of a real file: rung 0 uncommented, a NOP() header
+# rung with a 4-line banner, and a 1-line comment ending in a line break, which
+# Studio keeps. Entries end in LF, comment lines in CR LF, and the final
+# .replace() is Studio's text-mode write turning each 0x0A byte into 0x0D 0x0A.
+SHS_FIXTURE_TEXT = (
+    "RG: [XIC(Gate[1].Unlocked),XIC(Gate[1].Fault)]OTE(Gate[1].Lamp);\n"
+    "RG: NOP();\n"
+    "RC: ********\r\nAREA 1 SAFETY GATE\r\nGATE 1\r\n********\n"
+    "RG: XIC(Gate[1].ResetPB)ONS(Gate[1].Edge.0)OTE(Gate[1].ResetCmd);\n"
+    "RC: RESET ON THE FALLING EDGE.\r\n\n"
+)
+SHS_FIXTURE = (b"\xff\xff\x00\x00\x10\x00CScrapFileHeader\x01\x00\x00\x00\xff\xfe\xff\x05"
+               + "rungs".encode("utf-16-le")
+               + SHS_FIXTURE_TEXT.encode("utf-16-le")).replace(b"\n", b"\r\n")
+SHS_FIXTURE_COMMENTS = [None, "********\nAREA 1 SAFETY GATE\nGATE 1\n********",
+                        "RESET ON THE FALLING EDGE.\n"]
 
 # A mid-routine empty rung must survive; exactly one trailing empty rung is dropped.
 EMPTY_NEUTRAL = "XIC(a)OTE(b);;XIC(c)OTE(d);"
@@ -1321,6 +1559,77 @@ def selftest(verbose: bool = True) -> tuple[int, int, list[str]]:
         if got != want:
             failures.append(f"detect({text[:32]!r}) returned {got!r}, expected {want!r}")
 
+    # 12b. Rung comments and Studio rung scrap (.shs) files.
+    if b"\x0d\x00\x0d\x0a\x00" not in SHS_FIXTURE:
+        failures.append("SHS fixture lost Studio's text-mode CR LF expansion")
+    shs_rungs, shs_comments, shs_warn = read_shs(SHS_FIXTURE)
+    checks.append(("Scrap file: rungs read",
+                   repr(shs_rungs),
+                   repr(["[XIC(Gate[1].Unlocked),XIC(Gate[1].Fault)]OTE(Gate[1].Lamp);",
+                         "NOP();",
+                         "XIC(Gate[1].ResetPB)ONS(Gate[1].Edge.0)OTE(Gate[1].ResetCmd);"])))
+    checks.append(("Scrap file: each comment goes to the rung before it",
+                   repr(shs_comments), repr(SHS_FIXTURE_COMMENTS)))
+    checks.append(("Scrap file rebuilds byte for byte",
+                   build_shs(shs_rungs, shs_comments).hex(), SHS_FIXTURE.hex()))
+    pane_text, _ = shs_pane_text(SHS_FIXTURE)
+    checks.append(("Scrap file shows comments above their rung",
+                   pane_text,
+                   "[XIC(Gate[1].Unlocked),XIC(Gate[1].Fault)]OTE(Gate[1].Lamp);\n"
+                   "// ********\n// AREA 1 SAFETY GATE\n// GATE 1\n// ********\n"
+                   "NOP();\n"
+                   "// RESET ON THE FALLING EDGE.\n//\n"
+                   "XIC(Gate[1].ResetPB)ONS(Gate[1].Edge.0)OTE(Gate[1].ResetCmd);"))
+    via_pane = convert(pane_text)
+    checks.append(("Scrap -> pane -> scrap is byte for byte",
+                   build_shs(via_pane.neutral_lines, via_pane.comments).hex(),
+                   SHS_FIXTURE.hex()))
+    via_ascii = convert("\n".join(via_pane.output_lines))
+    checks.append(("Comments survive the ASCII side and back",
+                   build_shs(via_ascii.neutral_lines, via_ascii.comments).hex(),
+                   SHS_FIXTURE.hex()))
+    for label, single in (("ASCII output", via_pane.output),
+                          ("single-line input", via_pane.input_single)):
+        if "//" in single or "AREA" in single or "\n" in single:
+            failures.append(f"comment text leaked into the {label}: {single[:60]!r}")
+    checks.append((
+        "A comment belongs to the next rung, even after a missing EOR",
+        repr(convert("XIC a OTE b\n// note\nSOR XIC c OTE d EOR").comments),
+        repr([None, "note"]),
+    ))
+    checks.append((
+        "'//' after logic on the same line is not a comment",
+        repr([c for c in convert("XIC(a)OTE(b);\n  // indented is fine\n"
+                                 "XIC(c)OTE(d); // not this").comments if c]),
+        repr(["indented is fine"]),
+    ))
+    checks.append((
+        "A commented empty last rung is kept",
+        repr(convert("XIC(a);\n// spare\n;").comments), repr([None, "spare"]),
+    ))
+    if detect("// SOR BND ; EOR\nXIC(a)OTE(b);") != "Neutral":
+        failures.append("a comment mentioning ASCII keywords changed the detected format")
+    if detect("// only a comment") is not None:
+        failures.append("comment-only input should count as empty")
+    if not any("belongs to no rung" in w for w in convert("XIC(a);\n// orphan").warnings):
+        failures.append("a comment after the last rung raised no warning")
+    if ("comment" not in [cat for *_, cat in highlight_spans("// hi\nXIC(a);", "Neutral")]
+            or "comment" not in [cat for *_, cat in highlight_spans("// hi\nXIC a EOR", "ASCII")]):
+        failures.append("comment lines are not highlighted as comments")
+    for label, bad in (("not a scrap", b"hello"),
+                       ("not rungs", SHS_CLASS + b"\x01\x00\x00\x00\xff\xfe\xff\x04"
+                                     + "tags".encode("utf-16-le"))):
+        try:
+            read_shs(bad)
+            failures.append(f"read_shs accepted a file that is {label}")
+        except ConversionError:
+            pass
+    try:
+        build_shs(["CPT(d,a +\nb);"], [None])
+        failures.append("build_shs wrote a rung containing a line break")
+    except ConversionError:
+        pass
+
     # 13. Unrecognized mnemonics warn but are never dropped.
     rungs, warns = parse_ascii("SOR EXAMPLE_AOI Tag_A XYZQ Tag_B EOR")
     emitted = emit_neutral(rungs)
@@ -1415,6 +1724,7 @@ def launch_gui() -> None:
 
         def __init__(self, master, **kw):
             super().__init__(master, **kw)
+            self.edit_serial = 0         # bumped on every content change
             self._orig = str(self) + "_orig"
             self.tk.call("rename", str(self), self._orig)
             self.tk.createcommand(str(self), self._proxy)
@@ -1424,6 +1734,8 @@ def launch_gui() -> None:
                 result = self.tk.call((self._orig,) + args)
             except tk.TclError:
                 return ""
+            if args and args[0] in ("insert", "delete", "replace"):
+                self.edit_serial += 1
             if args and args[0] in ("insert", "delete", "replace", "yview", "xview", "see"):
                 try:
                     self.event_generate("<<Changed>>", when="tail")
@@ -1476,6 +1788,8 @@ def launch_gui() -> None:
             self.text.bind("<MouseWheel>", lambda e: self._schedule_redraw())
             self._redraw_job = None
             self._pending_paste = False
+            self._numbers: list[int | None] = []
+            self._numbers_serial = -1
 
         # -- scrolling ----------------------------------------------------
         def _on_vbar(self, *args):
@@ -1597,26 +1911,46 @@ def launch_gui() -> None:
             if self._redraw_job is None:
                 self._redraw_job = self.after_idle(self._redraw_gutter)
 
+        def rung_numbers(self) -> list[int | None]:
+            """Per pane line, the rung number to show: comment lines get None, and
+            the other lines count up from 0. Recomputed only after an edit."""
+            if self._numbers_serial != self.text.edit_serial:
+                numbers: list[int | None] = []
+                rung = 0
+                for line in self.get().split("\n"):
+                    if COMMENT_LINE.fullmatch(line):
+                        numbers.append(None)
+                    else:
+                        numbers.append(rung)
+                        rung += 1
+                self._numbers = numbers
+                self._numbers_serial = self.text.edit_serial
+            return self._numbers
+
         def _redraw_gutter(self):
             self._redraw_job = None
             try:
                 self.gutter.delete("all")
             except tk.TclError:
                 return
+            numbers = self.rung_numbers()
+            last = int(self.text.index("end-1c").split(".")[0])
             index = self.text.index("@0,0")
-            while True:
+            lineno = int(str(index).split(".")[0])
+            while lineno <= last:
                 info = self.text.dlineinfo(index)
                 if info is None:
                     break
-                y = info[1]
-                lineno = int(str(index).split(".")[0])
-                self.gutter.create_text(
-                    40, y, anchor="ne", text=str(lineno - 1), font=MONO, fill=GUTTER_FG,
-                )
-                nxt = self.text.index(f"{index}+1line")
-                if nxt == index:
-                    break
-                index = nxt
+                rung = numbers[lineno - 1] if lineno - 1 < len(numbers) else None
+                if rung is not None:
+                    self.gutter.create_text(
+                        40, info[1], anchor="ne", text=str(rung), font=MONO,
+                        fill=GUTTER_FG,
+                    )
+                # Step to the START of the next logical line. "+1line" would keep the
+                # column, which under word wrap lands on a continuation row.
+                lineno += 1
+                index = f"{lineno}.0"
 
     class App(ttk.Frame):
         def __init__(self, master):
@@ -1627,6 +1961,10 @@ def launch_gui() -> None:
             self.current_input_single = ""       # single-line form of the input
             self.last_error: str | None = None   # set when a conversion raised
             self.current_input_lines: list[str] = []
+            self.current_output_lines: list[str] = []   # display form, with comments
+            self.current_neutral_lines: list[str] = []  # for a .shs, one per rung
+            self.current_comments: list[str | None] = []
+            self.current_warnings: list[str] = []
             self._convert_job = None
             self._suppress = False
 
@@ -1634,6 +1972,7 @@ def launch_gui() -> None:
             self.sync_var = tk.BooleanVar(value=True)
             self.case_var = tk.BooleanVar(value=False)
             self.word_var = tk.BooleanVar(value=False)
+            self.comments_var = tk.BooleanVar(value=False)   # Include comments
             self.hilite_var = tk.BooleanVar(value=True)
             self.find_var = tk.StringVar()
             self.repl_var = tk.StringVar()
@@ -1687,6 +2026,8 @@ def launch_gui() -> None:
             bar.pack(fill="x", pady=(0, 4))
             ttk.Button(bar, text="Load file…", command=self.load_file).pack(side="left")
             ttk.Button(bar, text="Save output…", command=self.save_file).pack(side="left", padx=(4, 0))
+            ttk.Button(bar, text="Save .shs for Studio…",
+                       command=self.save_shs).pack(side="left", padx=(4, 0))
             ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
             # underline= marks the Alt accelerator letter, Office-style.
             ttk.Button(bar, text="Copy output (Studio-safe, 1 line)", underline=0,
@@ -1739,6 +2080,8 @@ def launch_gui() -> None:
                             variable=self.case_var, command=self.update_match_count).pack(side="left", padx=(4, 0))
             ttk.Checkbutton(self.findbar, text="Whole word",
                             variable=self.word_var, command=self.update_match_count).pack(side="left", padx=(4, 0))
+            ttk.Checkbutton(self.findbar, text="Include comments",
+                            variable=self.comments_var, command=self.update_match_count).pack(side="left", padx=(4, 0))
             self.match_label = ttk.Label(self.findbar, text="", foreground="#555")
             self.match_label.pack(side="left", padx=(10, 0))
             ttk.Button(self.findbar, text="✕",
@@ -1787,6 +2130,7 @@ def launch_gui() -> None:
             filemenu = tk.Menu(menubar, tearoff=0)
             filemenu.add_command(label="Load file…", command=self.load_file)
             filemenu.add_command(label="Save output…", command=self.save_file)
+            filemenu.add_command(label="Save .shs for Studio…", command=self.save_shs)
             filemenu.add_separator()
             filemenu.add_command(label="Exit", command=master.destroy)
             menubar.add_cascade(label="File", menu=filemenu)
@@ -1869,10 +2213,13 @@ def launch_gui() -> None:
             self.output_label.config(text=f"{result.output_kind}")
             self.current_output = result.output
             self.current_input_lines = result.input_lines
-            # Neutral rungs already end in ';' and butt together; ASCII rungs are
-            # space-delimited. Either way the copied form is one line.
-            joiner = "" if result.kind == "Neutral" else " "
-            self.current_input_single = joiner.join(result.input_lines)
+            self.current_output_lines = result.output_lines
+            self.current_neutral_lines = result.neutral_lines
+            self.current_comments = result.comments
+            self.current_warnings = result.warnings
+            # The copied input is one line with no comments: plain text cannot
+            # carry them. Only a saved .shs does.
+            self.current_input_single = result.input_single
             output_display = "\n".join(result.output_lines)
             self.output_pane.set(output_display, keep_view=True)
 
@@ -1905,6 +2252,10 @@ def launch_gui() -> None:
             self.current_output = ""
             self.current_input_single = ""
             self.current_input_lines = []
+            self.current_output_lines = []
+            self.current_neutral_lines = []
+            self.current_comments = []
+            self.current_warnings = []
 
         def set_input_text(self, value: str):
             self._suppress = True
@@ -1935,7 +2286,8 @@ def launch_gui() -> None:
         def swap(self):
             if not self.current_output:
                 return
-            self.set_input_text(self.current_output)
+            # The display form, so the comments come across too.
+            self.set_input_text("\n".join(self.current_output_lines))
             self.do_convert(reformat=True)
 
         def clear(self):
@@ -1967,19 +2319,42 @@ def launch_gui() -> None:
         def load_file(self):
             path = filedialog.askopenfilename(
                 title="Load rungs",
-                filetypes=[("Text files", "*.txt *.l5k *.L5K"), ("All files", "*.*")],
+                filetypes=[("Rungs", "*.shs *.txt *.l5k *.L5K"),
+                           ("Studio rung scrap", "*.shs"),
+                           ("Text files", "*.txt *.l5k *.L5K"), ("All files", "*.*")],
             )
-            if not path:
-                return
+            if path:
+                self.load_path(path)
+
+        def load_path(self, path: str) -> bool:
+            """Load rungs from a text file or a Studio rung scrap (.shs)."""
             try:
-                with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+                with open(path, "rb") as fh:
                     data = fh.read()
             except OSError as exc:
                 messagebox.showerror(APP_TITLE, f"Could not read file:\n{exc}")
-                return
-            self.set_input_text(data)
+                return False
+            notes: list[str] = []
+            if is_shs(data):        # by content, not extension
+                try:
+                    text, notes = shs_pane_text(data)
+                except ConversionError as exc:
+                    messagebox.showerror(APP_TITLE, f"Could not read {path}:\n{exc}")
+                    return False
+            else:
+                text = data.decode("utf-8-sig", errors="replace")
+            self.set_input_text(text)
             self.do_convert(reformat=True)
-            self.status.config(text=f"Loaded {path}")
+            if notes and not self.last_error:
+                self.set_warning("  ".join(notes + self.current_warnings))
+            if is_shs(data) and not self.last_error:
+                n_comments = sum(c is not None for c in self.current_comments)
+                self.status.config(
+                    text=f"Loaded {len(self.current_neutral_lines)} rung(s) and "
+                         f"{n_comments} comment(s) from {path}")
+            else:
+                self.status.config(text=f"Loaded {path}")
+            return True
 
         def save_file(self):
             if not self.current_output:
@@ -2001,6 +2376,37 @@ def launch_gui() -> None:
                 messagebox.showerror(APP_TITLE, f"Could not write file:\n{exc}")
                 return
             self.status.config(text=f"Saved single-line output to {path}")
+
+        def save_shs(self):
+            if not self.current_neutral_lines:
+                messagebox.showinfo(APP_TITLE, "There are no rungs to save.")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save rungs and comments for Studio (.shs)",
+                defaultextension=".shs", initialfile="Converted rungs.shs",
+                filetypes=[("Studio rung scrap", "*.shs"), ("All files", "*.*")],
+            )
+            if path:
+                self.save_shs_to(path)
+
+        def save_shs_to(self, path: str) -> bool:
+            """Write the rungs, in Neutral form, with their comments as a scrap file
+            that can be dragged into a Studio routine."""
+            try:
+                data = build_shs(self.current_neutral_lines, self.current_comments)
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            except ConversionError as exc:
+                messagebox.showerror(APP_TITLE, str(exc))
+                return False
+            except OSError as exc:
+                messagebox.showerror(APP_TITLE, f"Could not write file:\n{exc}")
+                return False
+            n_comments = sum(c is not None for c in self.current_comments)
+            self.status.config(
+                text=f"Saved {len(self.current_neutral_lines)} rung(s) and {n_comments} "
+                     f"comment(s) to {path} — drag the file into a routine in Studio.")
+            return True
 
         def apply_wrap(self):
             self.input_pane.set_wrap(self.wrap_var.get())
@@ -2183,6 +2589,26 @@ def launch_gui() -> None:
             flags = 0 if self.case_var.get() else re.IGNORECASE
             return re.compile(pat, flags)
 
+        def _skip_ranges(self, text: str) -> list[tuple[int, int]]:
+            """(start, end) of every comment line, unless Include comments is on."""
+            if self.comments_var.get():
+                return []
+            return [(m.start(), m.end()) for m in COMMENT_LINE.finditer(text)]
+
+        @staticmethod
+        def _skipped(pos: int, skips: list[tuple[int, int]], starts: list[int]) -> bool:
+            k = bisect.bisect_right(starts, pos) - 1
+            return k >= 0 and pos < skips[k][1]
+
+        def _matches(self, pat, text: str, pos: int = 0):
+            """Matches of `pat` in `text` from `pos` on, skipping comment lines
+            unless Include comments is ticked."""
+            skips = self._skip_ranges(text)
+            starts = [s for s, _ in skips]
+            for m in pat.finditer(text, pos):
+                if not self._skipped(m.start(), skips, starts):
+                    yield m
+
         def update_match_count(self):
             if not self.find_visible:
                 return
@@ -2191,19 +2617,18 @@ def launch_gui() -> None:
                 self.match_label.config(text="")
                 self.refresh_find_highlight()
                 return
-            n = len(pat.findall(self.input_pane.get()))
+            n = sum(1 for _ in self._matches(pat, self.input_pane.get()))
             self.match_label.config(text=f"{n} match{'' if n == 1 else 'es'}")
             self.refresh_find_highlight()
 
-        @staticmethod
-        def _match_ranges(pat, text: str):
+        def _match_ranges(self, pat, text: str):
             """(line, start_col, end_col) for every match, clamped to its own line."""
             line_starts = [0]
             for idx, ch in enumerate(text):
                 if ch == "\n":
                     line_starts.append(idx + 1)
             ranges = []
-            for m in pat.finditer(text):
+            for m in self._matches(pat, text):
                 line = bisect.bisect_right(line_starts, m.start()) - 1
                 base = line_starts[line]
                 line_end = (line_starts[line + 1] - 1 if line + 1 < len(line_starts)
@@ -2241,9 +2666,9 @@ def launch_gui() -> None:
             widget = self.input_pane.text
             start = widget.index("insert")
             offset = len(widget.get("1.0", start))
-            m = pat.search(text, offset)
+            m = next(self._matches(pat, text, offset), None)
             if m is None:
-                m = pat.search(text, 0)        # wrap around
+                m = next(self._matches(pat, text, 0), None)    # wrap around
             if m is None:
                 self.status.config(text="No matches.")
                 return
@@ -2268,7 +2693,11 @@ def launch_gui() -> None:
                 self.find_next()
                 return
             selected = widget.get(sel_start, sel_end)
-            if pat.fullmatch(selected):
+            text = self.input_pane.get()
+            skips = self._skip_ranges(text)
+            in_comment = self._skipped(len(widget.get("1.0", sel_start)), skips,
+                                       [s for s, _ in skips])
+            if pat.fullmatch(selected) and not in_comment:
                 widget.delete(sel_start, sel_end)
                 widget.insert(sel_start, self.repl_var.get())
                 self.on_input_change()
@@ -2280,7 +2709,19 @@ def launch_gui() -> None:
                 return
             self._remember_replace()
             text = self.input_pane.get()
-            new, count = pat.subn(self.repl_var.get().replace("\\", "\\\\"), text)
+            repl = self.repl_var.get().replace("\\", "\\\\")
+            # Replace only between the skipped comment lines (all of the text when
+            # Include comments is on). A match never spans a line, so it never
+            # straddles a comment boundary.
+            pieces: list[str] = []
+            count, last = 0, 0
+            for start, end in self._skip_ranges(text) + [(len(text), len(text))]:
+                segment, n = pat.subn(repl, text[last:start])
+                pieces.append(segment)
+                pieces.append(text[start:end])
+                count += n
+                last = end
+            new = "".join(pieces)
             if count:
                 self.set_input_text(new)
                 self.do_convert()
